@@ -13,6 +13,8 @@ import logging
 import ipaddress
 import os
 import ctypes
+import threading
+import time
 
 # 隐藏控制台窗口（仅在Windows上运行.py文件时）
 if platform.system().lower() == 'windows' and getattr(sys, 'frozen', False) == False:
@@ -67,6 +69,11 @@ class RouteManager:
         # 检测管理员权限
         self.is_admin = is_admin() if self.is_windows else True
         logger.info(f"管理员权限: {self.is_admin}")
+
+        # 添加接口信息缓存
+        self._interfaces_cache = None
+        self._interfaces_cache_time = 0
+        self._interfaces_cache_duration = 30  # 缓存30秒
 
         # 如果没有管理员权限，提示用户
         if self.is_windows and not self.is_admin:
@@ -586,8 +593,18 @@ class RouteManager:
         except Exception as e:
             self.log(f"命令执行异常: {str(e)}")
 
-    def get_network_interfaces(self):
-        """获取系统网络接口列表"""
+    def get_network_interfaces(self, force_refresh=False):
+        """获取系统网络接口列表（带缓存）"""
+        current_time = time.time()
+
+        # 检查缓存是否有效
+        if (not force_refresh and
+            self._interfaces_cache is not None and
+            current_time - self._interfaces_cache_time < self._interfaces_cache_duration):
+            self.log(f"使用缓存的接口信息 ({len(self._interfaces_cache)} 个接口)")
+            return self._interfaces_cache.copy()
+
+        # 缓存失效或强制刷新，重新获取
         interfaces = []
         try:
             if self.is_windows:
@@ -600,15 +617,23 @@ class RouteManager:
             # 按接口编号排序
             interfaces.sort(key=lambda x: x['number'])
 
+            # 更新缓存
+            self._interfaces_cache = interfaces.copy()
+            self._interfaces_cache_time = current_time
+
             self.log(f"获取到 {len(interfaces)} 个网络接口")
 
         except Exception as e:
             self.log(f"获取网络接口失败: {e}")
+            # 如果获取失败但有过期缓存，返回过期缓存
+            if self._interfaces_cache is not None:
+                self.log("使用过期的缓存接口信息")
+                return self._interfaces_cache.copy()
 
         return interfaces
 
     def _get_windows_interfaces(self):
-        """获取Windows系统的网络接口信息（带编码处理）"""
+        """获取Windows系统的网络接口信息（优化版）"""
         interfaces = []
 
         try:
@@ -617,13 +642,17 @@ class RouteManager:
                                        capture_output=True,
                                        text=True,
                                        shell=True,
-                                       timeout=10,
+                                       timeout=5,  # 减少超时时间
                                        encoding='utf-8',
-                                       errors='ignore')  # 忽略编码错误
+                                       errors='ignore')
 
             if route_result.returncode == 0:
                 lines = route_result.stdout.split('\n')
                 in_interface_list = False
+
+                # 预编译正则表达式提高性能
+                mac_pattern = re.compile(r'([0-9A-Fa-f]{2}[-\s][0-9A-Fa-f]{2}[-\s][0-9A-Fa-f]{2}[-\s][0-9A-Fa-f]{2}[-\s][0-9A-Fa-f]{2}[-\s][0-9A-Fa-f]{2})')
+                ip_pattern = re.compile(r'(\d+\.\d+\.\d+\.\d+)')
 
                 for line in lines:
                     line = line.strip()
@@ -634,11 +663,11 @@ class RouteManager:
                         break
 
                     if in_interface_list and line and ('....' in line or '...' in line):
-                        # 解析接口信息
+                        # 优化接口信息解析
                         if '....' in line:
-                            parts = line.split('....')
+                            parts = line.split('....', 1)  # 只分割第一个
                         else:
-                            parts = line.split('...')
+                            parts = line.split('...', 1)
 
                         if len(parts) >= 2:
                             interface_num = parts[0].strip()
@@ -659,31 +688,19 @@ class RouteManager:
 
                             # 清理接口名称，移除MAC地址和其他特殊字符
                             interface_name = interface_name.lstrip('.:').strip()
+                            interface_name = mac_pattern.sub('', interface_name).strip()
 
-                            # 移除可能的MAC地址部分
-                            mac_pattern = r'([0-9A-Fa-f]{2}[-\s][0-9A-Fa-f]{2}[-\s][0-9A-Fa-f]{2}[-\s][0-9A-Fa-f]{2}[-\s][0-9A-Fa-f]{2}[-\s][0-9A-Fa-f]{2})'
-                            interface_name = re.sub(mac_pattern, '', interface_name).strip()
-
-                            # 尝试获取IP地址（简化版本）
+                            # 简化IP地址获取 - 只从route print输出中提取
                             ips = []
-                            try:
-                                # 使用netsh获取接口IP信息，也使用编码错误处理
-                                netsh_result = subprocess.run(['netsh', 'interface', 'ip', 'show', 'address', interface_num],
-                                                           capture_output=True,
-                                                           text=True,
-                                                           shell=True,
-                                                           timeout=10,
-                                                           encoding='utf-8',
-                                                           errors='ignore')
-                                if netsh_result.returncode == 0:
-                                    for netsh_line in netsh_result.stdout.split('\n'):
-                                        ip_match = re.search(r'(\d+\.\d+\.\d+\.\d+)', netsh_line)
-                                        if ip_match:
-                                            ip = ip_match.group(1)
-                                            if ip not in ['127.0.0.1', '0.0.0.0']:
-                                                ips.append(ip)
-                            except:
-                                pass
+                            for ip_line in lines:
+                                if interface_num in ip_line:
+                                    ip_match = ip_pattern.search(ip_line)
+                                    if ip_match:
+                                        ip = ip_match.group(1)
+                                        if ip not in ['127.0.0.1', '0.0.0.0', '255.255.255.255'] and ip not in ips:
+                                            ips.append(ip)
+                                            if len(ips) >= 2:  # 只取前2个IP
+                                                break
 
                             # 构建显示名称
                             if interface_name:
@@ -692,7 +709,7 @@ class RouteManager:
                                 display_name = f"接口 {interface_num}"
 
                             if ips:
-                                display_name += f" ({', '.join(ips[:2])})"  # 显示前2个IP
+                                display_name += f" ({', '.join(ips)})"
 
                             interfaces.append({
                                 'number': interface_num,
@@ -702,6 +719,8 @@ class RouteManager:
                                 'mac': None
                             })
 
+        except subprocess.TimeoutExpired:
+            self.log("获取接口信息超时")
         except Exception as e:
             self.log(f"获取Windows接口信息失败: {e}")
 
@@ -1181,6 +1200,8 @@ class EnhancedRouteDialog:
         self.result = None
         self.version = version
         self.manager = manager
+        self.interface_combo = None
+        self.interface_mapping = {}
 
         self.dialog = tk.Toplevel(parent)
         self.dialog.title(title)
@@ -1245,30 +1266,21 @@ class EnhancedRouteDialog:
                 interface_frame.grid(row=i, column=1, sticky=(tk.W, tk.E), padx=10, pady=5)
 
                 self.interface_var = tk.StringVar()
-                interface_combo = ttk.Combobox(interface_frame, textvariable=self.interface_var, width=30)
-                interface_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+                self.interface_combo = ttk.Combobox(interface_frame, textvariable=self.interface_var, width=30)
+                self.interface_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-                # 添加"自动选择"选项
-                interfaces = [("自动选择", "")]
+                # 添加加载状态和进度指示
+                self.loading_label = ttk.Label(interface_frame, text="⏳ 加载中...", foreground="gray")
+                self.loading_label.pack(side=tk.RIGHT, padx=(5, 0))
 
-                # 获取系统接口
-                try:
-                    system_interfaces = self.manager.get_network_interfaces()
-                    for interface in system_interfaces:
-                        display_name = interface['display']
-                        interface_num = interface['number']
-                        interfaces.append((display_name, interface_num))
-                except Exception as e:
-                    print(f"获取接口失败: {e}")
+                self.interface_combo['values'] = ["正在加载接口信息..."]
+                self.interface_combo.set("正在加载接口信息...")
+                self.interface_combo.config(state='readonly')
 
-                # 设置下拉框选项
-                interface_combo['values'] = [interface[0] for interface in interfaces]
-                interface_combo.set("自动选择")
+                # 启动后台线程加载接口信息
+                threading.Thread(target=self._load_interfaces_async, daemon=True).start()
 
-                # 保存接口映射
-                self.interface_mapping = {interface[0]: interface[1] for interface in interfaces}
-
-                self.entries[key] = interface_combo
+                self.entries[key] = self.interface_combo
             elif key == "persistent":
                 # 持久路由使用复选框
                 persistent_var = tk.BooleanVar()
@@ -1295,6 +1307,64 @@ class EnhancedRouteDialog:
         x = (self.dialog.winfo_screenwidth() // 2) - (self.dialog.winfo_width() // 2)
         y = (self.dialog.winfo_screenheight() // 2) - (self.dialog.winfo_height() // 2)
         self.dialog.geometry(f"+{x}+{y}")
+
+    def _load_interfaces_async(self):
+        """异步加载网络接口信息"""
+        try:
+            # 获取系统接口
+            interfaces = [("自动选择", "")]
+
+            try:
+                system_interfaces = self.manager.get_network_interfaces()
+                for interface in system_interfaces:
+                    display_name = interface['display']
+                    interface_num = interface['number']
+                    interfaces.append((display_name, interface_num))
+            except Exception as e:
+                print(f"获取接口失败: {e}")
+
+            # 在主线程中更新UI
+            self.dialog.after(0, self._update_interface_combo, interfaces)
+
+        except Exception as e:
+            print(f"异步加载接口失败: {e}")
+            # 在主线程中更新UI显示错误
+            self.dialog.after(0, self._update_interface_combo_error)
+
+    def _update_interface_combo(self, interfaces):
+        """在主线程中更新接口下拉框"""
+        try:
+            if self.interface_combo and self.interface_combo.winfo_exists():
+                # 设置下拉框选项
+                self.interface_combo['values'] = [interface[0] for interface in interfaces]
+                self.interface_combo.set("自动选择")
+                self.interface_combo.config(state='normal')
+
+                # 保存接口映射
+                self.interface_mapping = {interface[0]: interface[1] for interface in interfaces}
+
+                # 隐藏加载标签
+                if hasattr(self, 'loading_label') and self.loading_label.winfo_exists():
+                    self.loading_label.config(text="✅ 完成", foreground="green")
+                    self.dialog.after(1500, lambda: self.loading_label.destroy())
+        except:
+            pass
+
+    def _update_interface_combo_error(self):
+        """在主线程中更新接口下拉框显示错误"""
+        try:
+            if self.interface_combo and self.interface_combo.winfo_exists():
+                self.interface_combo['values'] = ["自动选择", "获取接口信息失败"]
+                self.interface_combo.set("自动选择")
+                self.interface_combo.config(state='normal')
+                self.interface_mapping = {"自动选择": "", "获取接口信息失败": ""}
+
+                # 更新加载标签显示错误
+                if hasattr(self, 'loading_label') and self.loading_label.winfo_exists():
+                    self.loading_label.config(text="❌ 加载失败", foreground="red")
+                    self.dialog.after(3000, lambda: self.loading_label.destroy())
+        except:
+            pass
 
     def ok_clicked(self):
         # 收集所有输入数据
