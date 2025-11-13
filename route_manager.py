@@ -63,6 +63,9 @@ class RouteManager:
         self.root.geometry("1200x800")
         self.root.minsize(1000, 600)
 
+        # 设置窗口图标
+        self._set_window_icon()
+
         # 检测操作系统
         self.is_windows = platform.system().lower() == 'windows'
         logger.info(f"操作系统: {platform.system()}")
@@ -83,6 +86,33 @@ class RouteManager:
 
         self.setup_ui()
         self.refresh_routes()
+
+    def _set_window_icon(self):
+        """设置窗口图标"""
+        try:
+            # 获取图标文件路径
+            icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon", "route_manager.ico")
+
+            # 检查图标文件是否存在
+            if os.path.exists(icon_path):
+                # 在Windows上设置图标
+                try:
+                    self.root.iconbitmap(icon_path)
+                    logger.info(f"已设置窗口图标: {icon_path}")
+                except Exception as e:
+                    logger.warning(f"Windows图标设置失败: {e}")
+
+                # 在Linux/macOS上尝试使用PhotoImage
+                try:
+                    icon_image = tk.PhotoImage(file=icon_path)
+                    self.root.iconphoto(True, icon_image)
+                    logger.info(f"已设置窗口图标: {icon_path}")
+                except Exception as e:
+                    logger.warning(f"PhotoImage图标设置失败: {e}")
+            else:
+                logger.warning(f"图标文件不存在: {icon_path}")
+        except Exception as e:
+            logger.warning(f"设置窗口图标时出错: {e}")
 
     def show_admin_prompt(self):
         """显示管理员权限提示"""
