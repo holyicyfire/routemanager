@@ -79,13 +79,22 @@ class RouteManager:
         self._interfaces_cache_time = 0
         self._interfaces_cache_duration = 30  # 缓存30秒
 
+        # 添加路由数据缓存
+        self._routes_cache = None
+        self._routes_cache_time = 0
+        self._routes_cache_duration = 60  # 缓存60秒
+
+        # 加载状态标志
+        self._is_loading_routes = False
+
         # 如果没有管理员权限，提示用户
         if self.is_windows and not self.is_admin:
             self.show_admin_prompt()
             return
 
         self.setup_ui()
-        self.refresh_routes()
+        # 延迟异步加载路由数据，不阻塞UI启动
+        self.root.after(100, self._delayed_refresh_routes)
 
     def _set_window_icon(self):
         """设置窗口图标"""
@@ -238,7 +247,7 @@ class RouteManager:
         style = ttk.Style()
         style.configure("Action.TButton", padding=(10, 5))
 
-        ttk.Button(button_frame, text="刷新", command=self.refresh_routes, style="Action.TButton").pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(button_frame, text="刷新", command=lambda: self.refresh_routes(force_refresh=True), style="Action.TButton").pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(button_frame, text="添加路由", command=self.add_route, style="Action.TButton").pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(button_frame, text="删除路由", command=self.delete_route, style="Action.TButton").pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(button_frame, text="设备IP信息", command=self.show_ip_info, style="Action.TButton").pack(side=tk.LEFT, padx=(0, 8))
@@ -253,9 +262,9 @@ class RouteManager:
         self.version_var = tk.StringVar(value="IPv4")
 
         ttk.Radiobutton(version_frame, text="IPv4", variable=self.version_var, value="IPv4",
-                       command=self.refresh_routes).pack(side=tk.LEFT, padx=(0, 15))
+                       command=lambda: self.refresh_routes(force_refresh=True)).pack(side=tk.LEFT, padx=(0, 15))
         ttk.Radiobutton(version_frame, text="IPv6", variable=self.version_var, value="IPv6",
-                       command=self.refresh_routes).pack(side=tk.LEFT)
+                       command=lambda: self.refresh_routes(force_refresh=True)).pack(side=tk.LEFT)
 
         # 创建路由显示区域 - 使用上下两个独立区域
         routes_container = ttk.Frame(main_frame)
@@ -360,9 +369,6 @@ class RouteManager:
 
         status_bar = ttk.Label(status_frame, textvariable=self.status_var, style="Status.TLabel", relief=tk.SOLID, background="#e9ecef")
         status_bar.pack(fill=tk.X)
-
-        # 初始加载路由
-        self.get_routes()
 
     def _update_persistent_columns_headers(self, version, widths=None):
         """更新持久路由表格的列标题"""
@@ -590,95 +596,143 @@ class RouteManager:
 
         return routes
 
-    def refresh_routes(self):
+    def _delayed_refresh_routes(self):
+        """延迟异步刷新路由表，不阻塞UI启动"""
+        if self._is_loading_routes:
+            return  # 避免重复加载
+
+        self._is_loading_routes = True
+        self.status_var.set("正在加载路由信息...")
+        self.log("开始异步加载路由数据...")
+
+        # 启动后台线程加载路由
+        threading.Thread(target=self._load_routes_async, daemon=True).start()
+
+    def _load_routes_async(self):
+        """异步加载路由数据"""
+        try:
+            # 检查缓存是否有效
+            current_time = time.time()
+            if (self._routes_cache is not None and
+                current_time - self._routes_cache_time < self._routes_cache_duration):
+                self.log("使用缓存的路由数据")
+                self.root.after(0, self._update_routes_display, self._routes_cache)
+                return
+
+            # 更新状态显示加载进度
+            self.root.after(0, lambda: self.status_var.set("正在获取系统路由信息..."))
+
+            # 获取路由数据
+            routes = self.get_routes()
+
+            # 更新状态显示解析进度
+            self.root.after(0, lambda: self.status_var.set("正在解析路由数据..."))
+
+            # 更新缓存
+            self._routes_cache = routes
+            self._routes_cache_time = current_time
+
+            # 在主线程中更新UI
+            self.root.after(0, self._update_routes_display, routes)
+
+        except Exception as e:
+            logger.error(f"异步加载路由失败: {e}")
+            self.root.after(0, self._show_load_error, str(e))
+
+    def _update_routes_display(self, routes):
+        """更新路由显示（主线程中执行）"""
+        try:
+            self._is_loading_routes = False
+            self.status_var.set("就绪")
+            self.log(f"路由数据加载完成，共 {len(routes)} 条路由")
+
+            # 清除现有条目
+            for item in self.active_tree.get_children():
+                self.active_tree.delete(item)
+            for item in self.persistent_tree.get_children():
+                self.persistent_tree.delete(item)
+
+            # 更新持久路由列标题
+            version = self.version_var.get()
+            self._update_persistent_columns_headers(version)
+
+            # 分离活动路由和持久路由
+            active_routes = []
+            persistent_routes = []
+
+            for route in routes:
+                if route.get('persistent', False):
+                    persistent_routes.append(route)
+                else:
+                    active_routes.append(route)
+
+            # 显示活动路由
+            for route in active_routes:
+                if version == "IPv4":
+                    values = (
+                        route.get('destination', ''),
+                        route.get('netmask', ''),
+                        route.get('gateway', ''),
+                        route.get('interface', ''),
+                        route.get('metric', '')
+                    )
+                else:  # IPv6
+                    values = (
+                        route.get('destination', ''),
+                        route.get('netmask', ''),
+                        route.get('gateway', ''),
+                        route.get('interface', ''),
+                        route.get('metric', '')
+                    )
+                self.active_tree.insert('', tk.END, values=values)
+
+            # 显示持久路由
+            for route in persistent_routes:
+                if version == "IPv4":
+                    values = (
+                        route.get('destination', ''),
+                        route.get('netmask', ''),
+                        route.get('gateway', ''),
+                        route.get('interface', ''),
+                        route.get('metric', '')
+                    )
+                else:  # IPv6
+                    values = (
+                        route.get('destination', ''),
+                        route.get('netmask', ''),
+                        route.get('gateway', ''),
+                        route.get('interface', ''),
+                        route.get('metric', '')
+                    )
+                self.persistent_tree.insert('', tk.END, values=values)
+
+            self.log(f"显示 {len(active_routes)} 条活动路由，{len(persistent_routes)} 条持久路由")
+
+        except Exception as e:
+            self.log(f"更新路由显示失败: {str(e)}")
+            self.status_var.set("更新路由显示失败")
+
+    def _show_load_error(self, error_message):
+        """显示加载错误（主线程中执行）"""
+        self._is_loading_routes = False
+        self.status_var.set("路由加载失败")
+        self.log(f"路由加载失败: {error_message}")
+        messagebox.showerror("加载错误", f"加载路由信息失败：{error_message}")
+
+    def refresh_routes(self, force_refresh=False):
         """刷新路由表显示"""
-        self.status_var.set("正在获取路由信息...")
-        self.root.update()
+        if self._is_loading_routes and not force_refresh:
+            self.log("路由正在加载中，请稍候...")
+            return
 
-        # 清除现有条目
-        for item in self.active_tree.get_children():
-            self.active_tree.delete(item)
-        for item in self.persistent_tree.get_children():
-            self.persistent_tree.delete(item)
+        # 如果是强制刷新，清除缓存
+        if force_refresh:
+            self._routes_cache = None
+            self._routes_cache_time = 0
+            self.log("强制刷新路由数据，清除缓存")
 
-        # 更新持久路由列标题
-        version = self.version_var.get()
-        self._update_persistent_columns_headers(version)
-
-        # 获取路由数据
-        routes = self.get_routes()
-
-        # 分离活动路由和持久路由
-        active_routes = []
-        persistent_routes = []
-
-        for route in routes:
-            if route.get('persistent', False):
-                persistent_routes.append(route)
-            else:
-                active_routes.append(route)
-
-        # 填充活动路由表格
-        for route in active_routes:
-            version = self.version_var.get()
-            if version == "IPv6":
-                # IPv6路由格式
-                self.active_tree.insert('', tk.END, values=(
-                    route['destination'],
-                    route['netmask'],  # IPv6中这是前缀长度
-                    route['gateway'],
-                    route['interface'],
-                    route['metric']
-                ))
-            else:
-                # IPv4路由格式
-                self.active_tree.insert('', tk.END, values=(
-                    route['destination'],
-                    route['netmask'],
-                    route['gateway'],
-                    route['interface'],
-                    route['metric']
-                ))
-
-        # 填充持久路由表格
-        for route in persistent_routes:
-            version = self.version_var.get()
-            if version == "IPv6":
-                # IPv6持久路由格式
-                self.persistent_tree.insert('', tk.END, values=(
-                    route['destination'],
-                    route['netmask'],  # IPv6中这是前缀长度
-                    route['gateway'],
-                    route['metric']
-                ))
-            else:
-                # IPv4持久路由格式
-                self.persistent_tree.insert('', tk.END, values=(
-                    route['destination'],
-                    route['netmask'],
-                    route['gateway'],
-                    route['metric']
-                ))
-
-        # 更新状态信息
-        total_routes = len(active_routes) + len(persistent_routes)
-
-        # 创建状态信息，包含详细的统计和权限状态
-        status_parts = []
-        status_parts.append(f"📡 活动路由: {len(active_routes)} 条")
-        if len(persistent_routes) > 0:
-            status_parts.append(f"💾 持久路由: {len(persistent_routes)} 条")
-        status_parts.append(f"📊 总计: {total_routes} 条")
-
-        # 添加权限状态
-        if self.is_windows:
-            if hasattr(self, 'is_admin') and self.is_admin:
-                status_parts.append("🔑 管理员权限: ✅")
-            else:
-                status_parts.append("🔑 管理员权限: ❌")
-
-        status_msg = " | ".join(status_parts)
-        self.status_var.set(status_msg)
+        # 使用异步加载
+        self._delayed_refresh_routes()
 
     def test_route_command(self):
         """测试route命令"""
