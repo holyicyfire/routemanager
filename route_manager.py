@@ -799,14 +799,16 @@ class RouteManager:
             self.log("路由正在加载中，请稍候...")
             return
 
-        # 如果是强制刷新，清除缓存
+        # 使用异步加载，但添加延迟确保路由表已更新
+        # 如果是强制刷新，清除缓存后立即触发刷新
         if force_refresh:
             self._routes_cache = None
             self._routes_cache_time = 0
             self.log("强制刷新路由数据，清除缓存")
-
-        # 使用异步加载，但添加延迟确保路由表已更新
-        self.root.after(500, self._delayed_refresh_routes)
+            self.root.after(100, self._delayed_refresh_routes)
+        else:
+            # 非强制刷新，使用原来的延迟逻辑
+            self.root.after(500, self._delayed_refresh_routes)
 
     def test_route_command(self):
         """测试route命令"""
@@ -1142,7 +1144,7 @@ class RouteManager:
                     self.log(f"输出: {result.stdout}")
                     messagebox.showinfo("成功", "路由添加成功")
                     # 延迟刷新路由表，确保系统有足够时间更新路由表
-                    self.root.after(1000, self.refresh_routes)
+                    self.root.after(1000, lambda: self.refresh_routes(force_refresh=True))
                 else:
                     self.log(f"命令执行失败! 返回码: {result.returncode}")
                     self.log(f"错误输出: {result.stderr}")
@@ -1422,7 +1424,7 @@ class RouteManager:
                     if result.returncode == 0:
                         self.log("删除成功")
                         messagebox.showinfo("成功", "路由删除成功")
-                        self.refresh_routes()
+                        self.refresh_routes(force_refresh=True)
                     else:
                         self.log(f"删除失败: {result.stderr}")
                         messagebox.showerror("错误", f"删除路由失败: {result.stderr}")
