@@ -408,13 +408,15 @@ class RouteManager:
             if self.is_windows:
                 if version == "IPv4":
                     self.log("执行命令: route print")
+                    # 使用GBK编码来处理中文Windows系统的输出
                     result = subprocess.run(['route', 'print'],
                                          capture_output=True,
                                          text=True,
                                          shell=True,
                                          timeout=10,
-                                         encoding='utf-8',
+                                         encoding='gbk',  # 改为GBK编码
                                          errors='ignore')
+                    self.log(f"执行结果返回码: {result.returncode}")
                     if result.returncode != 0:
                         raise Exception(f"执行route命令失败: {result.stderr}")
                     routes = self.parse_windows_routes(result.stdout)
@@ -425,7 +427,7 @@ class RouteManager:
                                          text=True,
                                          shell=True,
                                          timeout=10,
-                                         encoding='utf-8',
+                                         encoding='gbk',  # 改为GBK编码
                                          errors='ignore')
                     if result.returncode != 0:
                         raise Exception(f"执行route命令失败: {result.stderr}")
@@ -449,45 +451,82 @@ class RouteManager:
         in_active_routes = False
         in_persistent_routes = False
 
+        # 调试：输出前几行以了解格式
+        self.log(f"路由表输出前10行:")
+        for i, line in enumerate(lines[:10]):
+            self.log(f"行{i}: {repr(line)}")
+
         for line in lines:
             line = line.strip()
-            if line.startswith("Active Routes:"):
+            # 支持中英文标题
+            if line.startswith("Active Routes:") or "活动路由:" in line:
                 in_active_routes = True
                 in_persistent_routes = False
+                self.log("找到活动路由表开始")
                 continue
-            elif line.startswith("Persistent Routes:"):
+            elif line.startswith("Persistent Routes:") or "永久路由:" in line:
                 in_active_routes = False
                 in_persistent_routes = True
+                self.log("找到持久路由表开始")
+                # 添加调试信息，显示接下来的几行
+                idx = lines.index(line)
+                self.log(f"持久路由区域开始，接下来5行:")
+                for i in range(idx+1, min(idx+6, len(lines))):
+                    self.log(f"  行{i}: {repr(lines[i])}")
                 continue
-            elif (line.startswith("Interface List") and in_active_routes):
+            elif (line.startswith("Interface List") or "接口列表" in line) and in_active_routes:
                 # 只有在路由解析过程中遇到Interface List才退出
                 in_active_routes = False
                 in_persistent_routes = False
+                self.log("遇到接口列表，结束路由解析")
                 break
 
             # 处理活动路由和持久路由
-            if (in_active_routes or in_persistent_routes) and line and not line.startswith("Network") and not line.startswith("Network Address"):
+            if (in_active_routes or in_persistent_routes) and line:
+                # 跳过表头行
+                if (line.startswith("Network") or line.startswith("Network Address") or 
+                    "网络目标" in line or "网络地址" in line or "跃点数" in line):
+                    continue
+                
+                # 跳过分隔线
+                if line.startswith("===") or "===" in line:
+                    continue
+                    
                 parts = re.split(r'\s+', line)
+                self.log(f"解析行: {parts}")
+
+                # 处理"在链路上"网关
+                for i, part in enumerate(parts):
+                    if part == "在链路上":
+                        parts[i] = "On-link"
 
                 # 添加更严格的验证，确保这是有效的路由条目
                 if in_persistent_routes:
-                    # 持久路由的格式可能不同
-                    if len(parts) >= 4 and self._is_valid_ip_address(parts[0]) and parts[0] != "Network":
-                        destination = parts[0]
-                        netmask = parts[1]
-                        gateway = parts[2]
-                        metric = parts[3]
-                        # 持久路由可能没有interface信息，设为空
-                        interface = ""
+                    # 持久路由的格式可能不同 - 放宽验证条件
+                    if len(parts) >= 4:
+                        # 检查第一个部分是否是有效的IP地址或网络地址
+                        if self._is_valid_ip_address(parts[0]) or parts[0] == "0.0.0.0":
+                            destination = parts[0]
+                            netmask = parts[1]
+                            gateway = parts[2]
+                            metric = parts[3] if len(parts) > 3 else ""
+                            # 持久路由可能没有interface信息，设为空
+                            interface = ""
 
-                        routes.append({
-                            'destination': destination,
-                            'netmask': netmask,
-                            'gateway': gateway,
-                            'interface': interface,
-                            'metric': metric,
-                            'persistent': True
-                        })
+                            routes.append({
+                                'destination': destination,
+                                'netmask': netmask,
+                                'gateway': gateway,
+                                'interface': interface,
+                                'metric': metric,
+                                'persistent': True
+                            })
+                            self.log(f"解析到持久路由: {destination}/{netmask} -> {gateway} (跃点: {metric})")
+                        else:
+                            self.log(f"持久路由IP验证失败: {parts[0]}")
+                    else:
+                        # 调试：显示为什么没有解析
+                        self.log(f"持久路由解析失败: 需要至少4个部分，实际{len(parts)}个, parts={parts}")
                 else:
                     # 活动路由的标准格式
                     if len(parts) >= 5 and self._is_valid_ip_address(parts[0]) and parts[0] != "Network":
@@ -505,14 +544,16 @@ class RouteManager:
                             'metric': metric,
                             'persistent': False
                         })
+                        self.log(f"解析到活动路由: {destination}/{netmask} -> {gateway}")
 
+        self.log(f"总共解析到 {len(routes)} 条路由")
         return routes
 
     def _is_valid_ip_address(self, address):
         """验证是否为有效的IP地址或网络地址"""
         try:
             # 检查是否为On-link（这是有效的网关值）
-            if address == "On-link":
+            if address == "On-link" or address == "在链路上":
                 return True
 
             # 检查是否为有效的IPv4地址或网络
@@ -530,6 +571,11 @@ class RouteManager:
                             return False
                     return True
 
+            # 检查是否为有效的IPv6地址
+            if ':' in address:
+                # 简化的IPv6验证 - 只要包含冒号就认为是有效的IPv6格式
+                return True
+
             return False
         except:
             return False
@@ -541,21 +587,40 @@ class RouteManager:
         in_ipv6_active = False
         in_ipv6_persistent = False
 
+        # 调试：输出前几行以了解格式
+        self.log(f"IPv6路由表输出前10行:")
+        for i, line in enumerate(lines[:10]):
+            self.log(f"行{i}: {repr(line)}")
+
         for line in lines:
             line = line.strip()
-            if 'IPv6 Route Table' in line:
+            # 支持中英文标题
+            if 'IPv6 Route Table' in line or 'IPv6 路由表' in line:
                 in_ipv6_active = True
                 in_ipv6_persistent = False
+                self.log("找到IPv6路由表开始")
                 continue
-            elif in_ipv6_active and ('Persistent Routes:' in line):
+            elif in_ipv6_active and ('Persistent Routes:' in line or '永久路由:' in line):
                 in_ipv6_active = False
                 in_ipv6_persistent = True
+                self.log("找到IPv6持久路由表开始")
+                # 添加调试信息，显示接下来的几行
+                idx = lines.index(line)
+                self.log(f"IPv6持久路由区域开始，接下来5行:")
+                for i in range(idx+1, min(idx+6, len(lines))):
+                    self.log(f"  行{i}: {repr(lines[i])}")
                 continue
-            elif (in_ipv6_active or in_ipv6_persistent) and (line.startswith('Interface List') or line.startswith('IPv4 Route Table')):
+            elif (in_ipv6_active or in_ipv6_persistent) and (line.startswith('Interface List') or '接口列表' in line or line.startswith('IPv4 Route Table') or 'IPv4 路由表' in line):
                 break
 
-            if (in_ipv6_active or in_ipv6_persistent) and line and not line.startswith('If') and not line.startswith('Network Destination'):
+            if (in_ipv6_active or in_ipv6_persistent) and line and not line.startswith('If') and not line.startswith('Network Destination') and '网络目标' not in line and '接口' not in line:
                 parts = [part for part in re.split(r'\s+', line) if part]
+                self.log(f"IPv6解析行: {parts}")
+
+                # 处理"在链路上"网关
+                for i, part in enumerate(parts):
+                    if part == "在链路上":
+                        parts[i] = "On-link"
 
                 if len(parts) >= 3:
                     interface_num = parts[0] if parts[0] else ''
@@ -593,12 +658,18 @@ class RouteManager:
                             'metric': metric,
                             'persistent': in_ipv6_persistent
                         })
+                        self.log(f"解析到IPv6路由: {destination}/{prefix_length} -> {gateway}")
+                else:
+                    # 调试：显示为什么没有解析
+                    self.log(f"IPv6路由解析失败: 需要至少3个部分，实际{len(parts)}个, parts={parts}")
 
+        self.log(f"总共解析到 {len(routes)} 条IPv6路由")
         return routes
 
     def _delayed_refresh_routes(self):
         """延迟异步刷新路由表，不阻塞UI启动"""
         if self._is_loading_routes:
+            self.log("路由加载已在进行中，跳过重复请求")
             return  # 避免重复加载
 
         self._is_loading_routes = True
@@ -623,7 +694,9 @@ class RouteManager:
             self.root.after(0, lambda: self.status_var.set("正在获取系统路由信息..."))
 
             # 获取路由数据
+            self.log("开始执行get_routes()...")
             routes = self.get_routes()
+            self.log(f"get_routes()完成，获取到{len(routes)}条路由")
 
             # 更新状态显示解析进度
             self.root.after(0, lambda: self.status_var.set("正在解析路由数据..."))
@@ -631,6 +704,7 @@ class RouteManager:
             # 更新缓存
             self._routes_cache = routes
             self._routes_cache_time = current_time
+            self.log("路由数据缓存已更新")
 
             # 在主线程中更新UI
             self.root.after(0, self._update_routes_display, routes)
@@ -725,14 +799,16 @@ class RouteManager:
             self.log("路由正在加载中，请稍候...")
             return
 
-        # 如果是强制刷新，清除缓存
+        # 使用异步加载，但添加延迟确保路由表已更新
+        # 如果是强制刷新，清除缓存后立即触发刷新
         if force_refresh:
             self._routes_cache = None
             self._routes_cache_time = 0
             self.log("强制刷新路由数据，清除缓存")
-
-        # 使用异步加载
-        self._delayed_refresh_routes()
+            self.root.after(100, self._delayed_refresh_routes)
+        else:
+            # 非强制刷新，使用原来的延迟逻辑
+            self.root.after(500, self._delayed_refresh_routes)
 
     def test_route_command(self):
         """测试route命令"""
@@ -994,29 +1070,56 @@ class RouteManager:
 
         # 构建命令
         try:
-            if self.is_windows:
-                if version == "IPv4":
-                    cmd = f'route -4 add {route_data["destination"]} mask {route_data["netmask"]} {route_data["gateway"]}'
-                    # 添加持久路由参数
-                    if route_data.get('persistent', False):
-                        cmd += ' -p'
-                    # 添加接口参数
-                    if route_data.get('interface'):
-                        cmd += f' IF {route_data["interface"]}'
-                    if route_data.get('metric'):
-                        cmd += f' metric {route_data["metric"]}'
+                if self.is_windows:
+                    if version == "IPv4":
+                        # 正确处理网关参数：如果网关是"On-link"，则省略网关参数，但需要接口
+                        gateway = route_data["gateway"]
+                        interface = route_data.get('interface', '')
+                        
+                        if gateway == "On-link":
+                            if interface:
+                                # On-link路由需要指定接口
+                                cmd = f'route -4 add {route_data["destination"]} mask {route_data["netmask"]} {interface}'
+                            else:
+                                # 如果没有指定接口，不能创建On-link路由
+                                messagebox.showerror("错误", "创建On-link路由必须指定网络接口")
+                                return
+                        else:
+                            cmd = f'route -4 add {route_data["destination"]} mask {route_data["netmask"]} {gateway}'
+                            # 添加接口参数（如果有指定接口）
+                            if interface:
+                                cmd += f' IF {interface}'
+                        
+                        # Windows route命令不支持源地址参数
+                        
+                        # 添加持久路由参数（必须在命令开头）
+                        if route_data.get('persistent', False):
+                            cmd = cmd.replace('route -4 add', 'route -p -4 add')
+                        
+                        # 添加跃点数参数
+                        if route_data.get('metric'):
+                            cmd += f' metric {route_data["metric"]}'
                 else:
                     prefix_len = route_data.get("prefix_length", "64")
-                    if route_data.get('gateway') and route_data['gateway'] != 'On-link':
-                        cmd = f'route -6 add {route_data["destination"]}/{prefix_len} {route_data["gateway"]}'
+                    gateway = route_data.get('gateway', '')
+                    
+                    # 正确处理IPv6路由命令
+                    if gateway and gateway != 'On-link':
+                        cmd = f'route -6 add {route_data["destination"]}/{prefix_len} {gateway}'
                     else:
                         cmd = f'route -6 add {route_data["destination"]}/{prefix_len}'
-                    # 添加持久路由参数
+                    
+                    # Windows route命令不支持源地址参数
+                    
+                    # 添加持久路由参数（必须在命令开头）
                     if route_data.get('persistent', False):
-                        cmd += ' -p'
+                        cmd = cmd.replace('route -6 add', 'route -p -6 add')
+                    
                     # 添加接口参数
                     if route_data.get('interface'):
                         cmd += f' IF {route_data["interface"]}'
+                    
+                    # 添加跃点数参数
                     if route_data.get('metric'):
                         cmd += f' metric {route_data["metric"]}'
 
@@ -1040,7 +1143,8 @@ class RouteManager:
                     self.log("命令执行成功!")
                     self.log(f"输出: {result.stdout}")
                     messagebox.showinfo("成功", "路由添加成功")
-                    self.refresh_routes()
+                    # 延迟刷新路由表，确保系统有足够时间更新路由表
+                    self.root.after(1000, lambda: self.refresh_routes(force_refresh=True))
                 else:
                     self.log(f"命令执行失败! 返回码: {result.returncode}")
                     self.log(f"错误输出: {result.stderr}")
@@ -1103,6 +1207,10 @@ class RouteManager:
                         ipaddress.ip_address(gateway)
                     except ValueError as e:
                         return f"网关地址格式不正确:\n{str(e)}"
+
+                # 源地址参数已移除
+
+                # 源地址参数已移除
 
                 # 验证接口
                 interface = route_data.get("interface", "").strip()
@@ -1184,12 +1292,14 @@ class RouteManager:
             error_msg += "   1. 右键点击命令提示符，选择'以管理员身份运行'\n"
             error_msg += "   2. 在管理员命令提示符中运行程序\n\n"
 
-        elif "invalid parameter" in stderr.lower() or "参数无效" in stderr:
+        elif "invalid parameter" in stderr.lower() or "参数无效" in stderr or "参数错误" in stderr:
             error_msg += "❌ 参数格式错误\n"
             error_msg += "   解决方案:\n"
             error_msg += "   1. 检查IP地址格式是否正确\n"
             error_msg += "   2. 检查子网掩码或前缀长度\n"
-            error_msg += "   3. 确保所有参数都有值\n\n"
+            error_msg += "   3. On-link路由必须指定网络接口\n"
+            error_msg += "   4. 持久路由参数 -p 必须在命令开头\n"
+            error_msg += "   5. 确保网关地址有效或使用正确的接口\n\n"
 
         elif "already exists" in stderr.lower() or "已存在" in stderr:
             error_msg += "❌ 路由已存在\n"
@@ -1314,7 +1424,7 @@ class RouteManager:
                     if result.returncode == 0:
                         self.log("删除成功")
                         messagebox.showinfo("成功", "路由删除成功")
-                        self.refresh_routes()
+                        self.refresh_routes(force_refresh=True)
                     else:
                         self.log(f"删除失败: {result.stderr}")
                         messagebox.showerror("错误", f"删除路由失败: {result.stderr}")
@@ -2076,6 +2186,19 @@ class IPInfoDialog:
             messagebox.showerror("错误", f"导出失败: {str(e)}")
             self.status_var.set("导出失败")
 
+    def on_tree_click(self, event):
+        """处理树形视图点击事件"""
+        item = self.routes_tree.identify_row(event.y)
+        column = self.routes_tree.identify_column(event.x)
+        
+        if item and column == "#1":  # 点击了选择列
+            values = list(self.routes_tree.item(item, 'values'))
+            if values[0] == "□":
+                values[0] = "✓"
+            else:
+                values[0] = "□"
+            self.routes_tree.item(item, values=values)
+
     def get_current_time(self):
         """获取当前时间字符串"""
         from datetime import datetime
@@ -2400,6 +2523,7 @@ class IPInfoDialog:
     def close_dialog(self):
         """关闭对话框"""
         self.dialog.destroy()
+
 
 if __name__ == "__main__":
     print("启动系统路由配置管理器...")
